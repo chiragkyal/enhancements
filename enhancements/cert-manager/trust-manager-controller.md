@@ -138,7 +138,7 @@ Each of the resources created for `trust-manager` deployment will have the below
 * `app: cert-manager-trust-manager`
 * `app.kubernetes.io/name: cert-manager-trust-manager`
 * `app.kubernetes.io/instance: cert-manager-trust-manager`
-* `app.kubernetes.io/version: "v0.20.2"`
+* `app.kubernetes.io/version: "v0.20.3"`
 * `app.kubernetes.io/managed-by: cert-manager-operator`
 * `app.kubernetes.io/part-of: cert-manager-operator`
 
@@ -162,6 +162,67 @@ A fork of [upstream trust-manager](https://github.com/cert-manager/trust-manager
 [downstream](https://github.com/openshift/cert-manager-trust-manager) for downstream management.
 
 ### Workflow Description
+
+The following diagram illustrates the end-to-end workflow for trust-manager deployment and trust bundle distribution:
+
+```mermaid
+flowchart TB
+    subgraph User["Cluster Administrator"]
+        A[Create TrustManager CR<br/>name: cluster]
+    end
+
+    subgraph Operator["cert-manager-operator"]
+        B[trust-manager-controller]
+        B --> C{Check Feature Gates}
+        C -->|Gates Enabled| D[Reconcile TrustManager CR]
+        C -->|Gates Disabled| X[Skip Reconciliation]
+    end
+
+    subgraph Resources["Created Resources in cert-manager namespace"]
+        D --> E[ServiceAccount]
+        D --> F[ClusterRole/ClusterRoleBinding]
+        D --> G[Role/RoleBinding<br/>in trust namespace]
+        D --> H[Deployment: trust-manager]
+        D --> I[Services]
+        D --> J[Certificate + Issuer<br/>for webhook TLS]
+        D --> K[ValidatingWebhookConfiguration]
+    end
+
+    subgraph SecretTargets["SecretTargets Configuration"]
+        D --> ST{secretTargets.policy?}
+        ST -->|Disabled| ST1[No secret write access]
+        ST -->|All| ST2[Add secret write rules<br/>to ClusterRole]
+        ST -->|Specific| ST3[Add secret write rules<br/>with resourceNames]
+        ST2 --> ST4[Add --secret-targets-enabled<br/>to Deployment args]
+        ST3 --> ST4
+    end
+
+    subgraph DefaultCA["DefaultCAPackage Configuration"]
+        D --> L{defaultCAPackage.policy<br/>Enabled?}
+        L -->|Yes| M[Create injection ConfigMap<br/>with CNO label]
+        M --> N[CNO injects<br/>trusted CA bundle]
+        N --> O[Controller formats<br/>CA bundle to JSON]
+        O --> P[Create package ConfigMap]
+        P --> Q[Mount to Deployment<br/>at /packages]
+        Q --> Q1[Add --default-package-location<br/>to Deployment args]
+        L -->|No| R[Skip DefaultCA setup]
+    end
+
+    subgraph TrustManager["trust-manager Operand"]
+        H --> S[trust-manager Pod<br/>Running]
+    end
+
+    subgraph BundleWorkflow["Bundle Distribution Workflow"]
+        T[User creates Bundle CR] --> S
+        S --> U[Watch Bundle sources<br/>ConfigMaps/Secrets]
+        U --> V[Combine CA certificates]
+        V --> W[Create/Update target<br/>ConfigMaps or Secrets]
+        W --> Y[Target namespaces<br/>matching selector]
+    end
+
+    A --> B
+```
+
 
 - Installation of `trust-manager`
   - An OpenShift user creates the `trustmanagers.operator.openshift.io` CR with name `cluster`.
@@ -394,10 +455,10 @@ type TrustManagerControllerConfig struct {
 type FilterExpiredCertificatesPolicy string
 
 const (
-	// FilterExpiredCertificatesEnabled filters out expired certificates from bundles.
-	FilterExpiredCertificatesEnabled FilterExpiredCertificatesPolicy = "Enabled"
-	// FilterExpiredCertificatesDisabled includes expired certificates in bundles.
-	FilterExpiredCertificatesDisabled FilterExpiredCertificatesPolicy = "Disabled"
+	// FilterExpiredCertificatesPolicyEnabled filters out expired certificates from bundles.
+	FilterExpiredCertificatesPolicyEnabled FilterExpiredCertificatesPolicy = "Enabled"
+	// FilterExpiredCertificatesPolicyDisabled includes expired certificates in bundles.
+	FilterExpiredCertificatesPolicyDisabled FilterExpiredCertificatesPolicy = "Disabled"
 )
 
 // SecretTargetsPolicy defines the policy for writing trust bundles to Secrets.
@@ -450,6 +511,10 @@ type TrustManagerStatus struct {
 None
 
 #### Standalone Clusters
+
+None
+
+#### OpenShift Kubernetes Engine
 
 None
 
@@ -682,7 +747,7 @@ Below are example static manifests used for creating required resources for inst
          serviceAccountName: trust-manager
          containers:
            - name: trust-manager
-             image: quay.io/jetstack/trust-manager:v0.20.2
+             image: quay.io/jetstack/trust-manager:v0.20.3
             args:
               - --log-format=text
               - --log-level=1
@@ -817,10 +882,11 @@ None
   default trust-manager configuration.
 - Enable `trust-manager-controller` by creating the `trustmanagers.operator.openshift.io` CR with permutations of 
   configurations and validate the behavior:
-  - Different log levels and formats
   - Custom trust namespace
   - Secret targets policy (Disabled/All/Specific)
   - DefaultCAPackage policy (Enabled/Disabled)
+  - FilterExpiredCertificates policy (Enabled/Disabled)
+  - Common configurations: log levels and formats, resources, node selector, tolerations and affinity
 - Test Bundle CRD functionality:
   - Create Bundle resources with various sources (ConfigMap, Secret, InLine)
   - Test `useDefaultCAs` source when `defaultCAPackage.policy` is `Enabled`
@@ -844,6 +910,7 @@ Trust-manager will be available as Tech Preview starting from cert-manager-opera
 - Evaluate adding `targetNamespaces` configuration to restrict which namespaces trust-manager can write Bundle 
   targets to (currently defaults to all namespaces).
 - Address upstream `Bundle` to `ClusterBundle` API migration if applicable (see Risks section for details).
+- Direct upgrade from Tech Preview to GA is not supported; users should perform a fresh operator installation.
 
 ### Removing a deprecated feature
 
@@ -881,10 +948,10 @@ trust-manager will be supported for:
 - Listing all the resources created for installing the `trust-manager`
   ```bash
   # Resources in cert-manager namespace (operand namespace)
-  oc get Certificates,Issuers,ClusterRoles,ClusterRoleBindings,Deployments,Roles,RoleBindings,Services,ServiceAccounts,ValidatingWebhookConfigurations,ConfigMaps -l "trustmanager.openshift.operator.io/managed-by=trust-manager-controller" -n cert-manager
+  oc get Certificates,Issuers,ClusterRoles,ClusterRoleBindings,Deployments,Roles,RoleBindings,Services,ServiceAccounts,ValidatingWebhookConfigurations,ConfigMaps -l "app.kubernetes.io/name=cert-manager-trust-manager" -n cert-manager
   
   # If trust namespace is different from cert-manager, also check for Role/RoleBinding there
-  # oc get Roles,RoleBindings -l "trustmanager.openshift.operator.io/managed-by=trust-manager-controller" -n <trust-namespace>
+  # oc get Roles,RoleBindings -l "app.kubernetes.io/name=cert-manager-trust-manager" -n <trust-namespace>
   ```
 
 - Checking TrustManager status
