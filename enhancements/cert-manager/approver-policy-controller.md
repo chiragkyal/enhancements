@@ -645,6 +645,74 @@ The generated manifests are stored in `bindata/approver-policy/resources/`
      signer names, scheduling, etc.)
    - Applies the customized resources to the cluster
 
+#### Helm Chart to API Field Mapping
+
+The following table maps every Helm chart option (`values.yaml`) to either a proposed API field or explains
+why it is operator-managed. This ensures complete coverage with no gaps.
+
+**Exposed via ApproverPolicy CR (user-configurable):**
+
+| Helm Option              | Default                     | API Field                                 | How It's Applied                                |
+| ------------------------ | --------------------------- | ----------------------------------------- | ----------------------------------------------- |
+| `app.logLevel`           | `1`                         | `approverPolicyConfig.logLevel`           | `--log-level` container arg                     |
+| `app.logFormat`          | `"text"`                    | `approverPolicyConfig.logFormat`          | `--log-format` container arg                    |
+| `app.approveSignerNames` | `[]`                        | `approverPolicyConfig.approveSignerNames` | **ClusterRole `resourceNames`** (NOT a CLI arg) |
+| `resources`              | `{}`                        | `approverPolicyConfig.resources`          | Deployment container resources                  |
+| `affinity`               | `{}`                        | `approverPolicyConfig.affinity`           | Deployment pod affinity                         |
+| `tolerations`            | `[]`                        | `approverPolicyConfig.tolerations`        | Deployment pod tolerations                      |
+| `nodeSelector`           | `{kubernetes.io/os: linux}` | `approverPolicyConfig.nodeSelector`       | Deployment pod nodeSelector                     |
+| `commonLabels`           | `{}`                        | `controllerConfig.labels`                 | Applied to all created resources                |
+| `podAnnotations`         | `{}`                        | `controllerConfig.annotations`            | Applied to all created resources                |
+
+**Operator-managed (NOT exposed in API — set to fixed/derived values):**
+
+| Helm Option                            | Default               | Operator Behavior                                | Rationale                                                                    |
+| -------------------------------------- | --------------------- | ------------------------------------------------ | ---------------------------------------------------------------------------- |
+| `crds.enabled/keep`                    | `true/true`           | Operator installs and manages CRD lifecycle      | CRD management is always operator-controlled                                 |
+| `replicaCount`                         | `1`                   | Operator sets default (1); not user-configurable | Consistent with IstioCSR/TrustManager; operator can adjust for HA internally |
+| `image.*`                              | upstream              | Set via `RELATED_IMAGE_APPROVER_POLICY` env var  | Standard operator image management for disconnected environments             |
+| `imagePullSecrets`                     | `[]`                  | Not needed                                       | OpenShift handles pull secrets at namespace/cluster level                    |
+| `app.extraArgs`                        | `[]`                  | Not exposed                                      | Users can use `UnsupportedConfigOverrides` for advanced args                 |
+| `app.metrics.port`                     | `9402`                | Hardcoded `9402`                                 | Internal detail; metrics scraping configured by operator                     |
+| `app.metrics.service.*`                | enabled, ClusterIP    | Always creates metrics Service                   | Required for monitoring                                                      |
+| `app.metrics.service.servicemonitor.*` | varies                | Operator manages ServiceMonitor                  | Follows operator monitoring pattern                                          |
+| `app.readinessProbe.port`              | `6060`                | Hardcoded `6060`                                 | Internal health check port                                                   |
+| `app.webhook.host`                     | `0.0.0.0`             | Hardcoded `0.0.0.0`                              | Always binds to all interfaces                                               |
+| `app.webhook.port`                     | `10250`               | Hardcoded `10250`                                | Fixed webhook serving port                                                   |
+| `app.webhook.timeoutSeconds`           | `5`                   | Hardcoded `5`                                    | Sane default for webhook timeout                                             |
+| `app.webhook.service.type`             | `ClusterIP`           | Hardcoded `ClusterIP`                            | Standard in-cluster service                                                  |
+| `hostNetwork`                          | `false`               | Hardcoded `false`                                | Not needed in OpenShift environment                                          |
+| `dnsPolicy`                            | `ClusterFirst`        | Hardcoded `ClusterFirst`                         | Default DNS policy                                                           |
+| `priorityClassName`                    | `""`                  | Not set (uses default)                           | Consistent with other add-ons                                                |
+| `topologySpreadConstraints`            | `[]`                  | Not set                                          | Not exposed by IstioCSR/TrustManager                                         |
+| `podDisruptionBudget.*`                | disabled              | Not created initially                            | Can be added later if needed                                                 |
+| `volumeMounts/volumes`                 | `[]`                  | Not set                                          | For custom root CAs; not needed in standard deployment                       |
+| `strategy`                             | `{}` (RollingUpdate)  | Default RollingUpdate                            | Standard deployment strategy                                                 |
+| `http_proxy/https_proxy/no_proxy`      | —                     | Inherited from cluster-wide proxy                | OpenShift manages proxy settings globally                                    |
+| `securityContext`                      | runAsNonRoot, seccomp | Operator sets OpenShift-compatible defaults      | Hardened security context                                                    |
+| `containerSecurityContext`             | drop ALL, readOnly    | Operator sets hardened defaults                  | Follows OpenShift SCC requirements                                           |
+
+**CLI flags from `options.go` (not in Helm chart) — all operator-managed:**
+
+| CLI Flag                        | Default                            | Operator Behavior               |
+| ------------------------------- | ---------------------------------- | ------------------------------- |
+| `--leader-election-namespace`   | `""`                               | Set to `cert-manager` namespace |
+| `--webhook-service-name`        | `cert-manager-approver-policy`     | Derived from resource naming    |
+| `--webhook-ca-secret-namespace` | `cert-manager`                     | Set to deployment namespace     |
+| `--webhook-ca-secret-name`      | `cert-manager-approver-policy-tls` | Derived from resource naming    |
+| `--webhook-ca-duration`         | `365d`                             | Sane default, not exposed       |
+| `--webhook-leaf-cert-duration`  | `7d`                               | Sane default, not exposed       |
+
+> **Note on `approveSignerNames`**: Unlike `logLevel` and `logFormat` which translate to CLI args,
+> `approveSignerNames` modifies the **ClusterRole resource** (specifically the `resourceNames` field
+> under the `approve` verb for `signers`). The controller dynamically patches the ClusterRole template
+> at reconciliation time based on this field's value. When empty, no `resourceNames` restriction is applied,
+> allowing approval for all signers.
+
+> **Note on port discrepancy**: The Helm chart defaults `app.webhook.port` to `10250`, while the binary
+> (`options.go`) defaults `--webhook-port` to `6443`. The operator uses Helm-derived manifests and explicitly
+> passes `--webhook-port=10250` as a container arg, so the Helm chart value (`10250`) takes precedence.
+
 #### Feature Gate Implementation
 
 The approver-policy controller is gated behind two mechanisms for the Tech Preview release:
