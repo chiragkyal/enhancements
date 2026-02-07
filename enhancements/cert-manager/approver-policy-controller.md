@@ -393,7 +393,81 @@ type CertManagerSpec struct {
 }
 ```
 
-#### 2. New `ApproverPolicy` CR
+#### 2. Changes to Existing `TrustManager` CR
+
+A new `approverPolicy` field is added to `TrustManagerConfig` to support explicit integration with
+approver-policy for trust-manager's webhook TLS certificate approval:
+
+```golang
+// TrustManagerConfig defines configuration specific to trust-manager.
+type TrustManagerConfig struct {
+	// ... existing fields ...
+
+	// approverPolicy configures the integration with approver-policy for trust-manager's
+	// webhook TLS certificate approval.
+	//
+	// When the built-in cert-manager auto-approver is disabled (via disableAutoApproval
+	// on the CertManager CR), trust-manager's webhook CertificateRequest will have no
+	// approver. Enabling this field creates a CertificateRequestPolicy and associated
+	// RBAC that allows approver-policy to approve trust-manager's webhook certificate
+	// automatically.
+	//
+	// Prerequisites for enabling this field:
+	// 1. The CertManager CR must have disableAutoApproval set to "true"
+	// 2. The ApproverPolicy CR must be created (approver-policy operand must be deployed)
+	//
+	// If disableAutoApproval is "true" but this field is not enabled, the trust-manager
+	// controller will set a Degraded condition because the webhook certificate cannot be
+	// approved without either the built-in approver or an approver-policy integration.
+	//
+	// If this field is enabled but the ApproverPolicy operand is not yet deployed,
+	// the controller will set a Degraded condition until approver-policy becomes available.
+	//
+	// +kubebuilder:validation:Optional
+	// +optional
+	ApproverPolicy ApproverPolicyWebhookConfig `json:"approverPolicy,omitempty"`
+}
+
+// ApproverPolicyWebhookConfig configures the approver-policy integration for
+// trust-manager's webhook TLS certificate.
+type ApproverPolicyWebhookConfig struct {
+	// enabled controls whether to create a CertificateRequestPolicy and RBAC
+	// resources that allow approver-policy to approve trust-manager's webhook
+	// TLS certificate.
+	//
+	// Prerequisites for enabling:
+	// 1. CertManager CR must have disableAutoApproval: "true"
+	// 2. ApproverPolicy CR must be created (approver-policy operand deployed)
+	//
+	// +kubebuilder:default:="Disabled"
+	// +kubebuilder:validation:Enum:=Enabled;Disabled
+	// +optional
+	Enabled ApproverPolicyWebhookPolicy `json:"enabled,omitempty"`
+
+	// certManagerServiceAccount is the name of cert-manager's ServiceAccount
+	// that will be granted permission to use the CertificateRequestPolicy.
+	// This is the ServiceAccount that cert-manager uses when creating
+	// CertificateRequests for trust-manager's webhook certificate.
+	// Defaults to "cert-manager".
+	// +kubebuilder:default:="cert-manager"
+	// +kubebuilder:validation:MinLength:=1
+	// +kubebuilder:validation:MaxLength:=253
+	// +kubebuilder:validation:Optional
+	// +optional
+	CertManagerServiceAccount string `json:"certManagerServiceAccount,omitempty"`
+}
+
+// ApproverPolicyWebhookPolicy defines the policy for the approver-policy webhook integration.
+// +kubebuilder:validation:Enum:=Enabled;Disabled
+type ApproverPolicyWebhookPolicy string
+
+const (
+	ApproverPolicyWebhookEnabled  ApproverPolicyWebhookPolicy = "Enabled"
+	ApproverPolicyWebhookDisabled ApproverPolicyWebhookPolicy = "Disabled"
+)
+```
+
+#### 3. New `ApproverPolicy` CR
 
 Below new API `approverpolicies.operator.openshift.io` is introduced for managing approver-policy.
 
@@ -1180,6 +1254,333 @@ Below are example static manifests used for creating required resources for inst
     friction to prevent accidental security degradation. All cert-manager configuration (overrideArgs, network
     policies, etc.) should be re-applied when recreating the CR.
 
+- **Trust-Manager Webhook Certificate Blocked When Auto-Approval Is Disabled**: trust-manager uses a cert-manager
+  `Certificate` resource to provision its webhook TLS. When `disableAutoApproval: "true"` is set, the built-in
+  approver is disabled, and trust-manager's webhook `CertificateRequest` will have no approver. This blocks
+  trust-manager's webhook from starting (new deployments) or renewing (existing deployments).
+  - Mitigation: A new `approverPolicy` field on the TrustManager CR allows users to explicitly enable the
+    creation of a `CertificateRequestPolicy` and RBAC resources for trust-manager's webhook certificate.
+    The trust-manager-controller validates all three preconditions (auto-approval disabled, field enabled,
+    approver-policy deployed) and degrades with clear messages if any are missing. See the
+    "Interaction with Trust-Manager" section for full details.
+
+### Interaction with Trust-Manager
+
+This is a critical cross-operand concern that arises when both trust-manager and approver-policy are managed
+by the cert-manager operator.
+
+Ref: [trust-manager installation — approver-policy integration](https://cert-manager.io/docs/trust/trust-manager/installation/)
+
+#### Background
+
+The operator currently creates these resources for trust-manager's webhook TLS (in `bindata/trust-manager/resources/`):
+
+1. **Issuer** (`trust-manager`, self-signed) — a namespace-scoped self-signed issuer in the cert-manager namespace
+2. **Certificate** (`trust-manager`) — requests a certificate from the Issuer, which creates a `CertificateRequest`
+3. The `CertificateRequest` is auto-approved by cert-manager's built-in approver → webhook TLS Secret is created
+
+The relevant bindata files:
+- `issuer_trust-manager.yml` — self-signed Issuer
+- `certificate_trust-manager.yml` — Certificate referencing the Issuer (commonName: `trust-manager.cert-manager.svc`)
+- `validatingwebhookconfiguration_trust-manager.yml` — uses `cert-manager.io/inject-ca-from` annotation
+
+#### The Problem
+
+When `disableAutoApproval: "true"` is set on the CertManager CR:
+- The built-in approver is disabled (`--controllers=*,-certificaterequests-approver`)
+- trust-manager's `CertificateRequest` is never approved
+- The webhook TLS Secret is never created (or not renewed on expiry)
+- **trust-manager's webhook is broken**
+
+This affects both deployment ordering scenarios:
+
+| Scenario                                                    | What happens                                                                                                                                                                                                  |
+| ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| trust-manager deployed **first**, approver-policy **later** | trust-manager works initially (built-in approver active), but when auto-approval is later disabled and the webhook cert expires, the renewal `CertificateRequest` won't be approved → webhook breaks silently |
+| approver-policy deployed **first**, trust-manager **later** | trust-manager's initial `CertificateRequest` is never approved → deployment never becomes ready                                                                                                               |
+
+#### Upstream Solution
+
+Upstream trust-manager solves this with Helm chart flags (see `deploy/charts/trust-manager/templates/certificate.yaml`):
+
+```bash
+helm upgrade trust-manager oci://quay.io/jetstack/charts/trust-manager \
+  --install \
+  --namespace cert-manager \
+  --wait \
+  --set app.webhook.tls.approverPolicy.enabled=true \
+  --set app.webhook.tls.approverPolicy.certManagerNamespace=cert-manager \
+  --set app.webhook.tls.approverPolicy.certManagerServiceAccount=cert-manager
+```
+
+The three upstream Helm values:
+
+| Upstream Helm Flag | Default | Purpose |
+|---|---|---|
+| `app.webhook.tls.approverPolicy.enabled` | `false` | Whether to create the CertificateRequestPolicy + RBAC for trust-manager's webhook cert |
+| `app.webhook.tls.approverPolicy.certManagerNamespace` | `"cert-manager"` | Namespace where cert-manager is installed (used in ClusterRoleBinding subject) |
+| `app.webhook.tls.approverPolicy.certManagerServiceAccount` | `"cert-manager"` | cert-manager's ServiceAccount name (used in ClusterRoleBinding subject) |
+
+> **Note**: If cert-manager is installed in a different namespace, `certManagerNamespace` must be set accordingly.
+
+When `enabled=true`, the Helm chart creates three additional resources:
+
+1. **CertificateRequestPolicy** (`trust-manager-policy`):
+   ```yaml
+   apiVersion: policy.cert-manager.io/v1alpha1
+   kind: CertificateRequestPolicy
+   metadata:
+     name: trust-manager-policy
+   spec:
+     allowed:
+       commonName:
+         value: "trust-manager.cert-manager.svc"
+         required: true
+       dnsNames:
+         values: ["trust-manager.cert-manager.svc"]
+         required: true
+     selector:
+       issuerRef:
+         name: trust-manager
+         kind: Issuer
+         group: cert-manager.io
+   ```
+
+2. **ClusterRole** (`trust-manager-policy-role`):
+   ```yaml
+   rules:
+     - apiGroups: ["policy.cert-manager.io"]
+       resources: ["certificaterequestpolicies"]
+       verbs: ["use"]
+       resourceNames: ["trust-manager-policy"]
+   ```
+
+3. **ClusterRoleBinding** (`trust-manager-policy-binding`): Binds cert-manager's ServiceAccount to the
+   ClusterRole, allowing it to "use" the `trust-manager-policy` CertificateRequestPolicy when creating
+   CertificateRequests for trust-manager's webhook certificate.
+
+#### Proposed Operator Handling: Explicit API Field on TrustManager CR
+
+Rather than having the trust-manager-controller automatically detect the `disableAutoApproval` state and
+create resources implicitly (which would require a cross-resource watch), we use an **explicit API field**
+on the TrustManager CR. This follows the principle of "explicit is better than implicit" and keeps the
+user in full control.
+
+**New API field on `TrustManagerConfig`:**
+
+```golang
+type TrustManagerConfig struct {
+    // ... existing fields ...
+
+    // approverPolicy configures the integration with approver-policy for trust-manager's
+    // webhook TLS certificate approval.
+    //
+    // When the built-in cert-manager auto-approver is disabled (via disableAutoApproval
+    // on the CertManager CR), trust-manager's webhook CertificateRequest will have no
+    // approver. Enabling this field creates a CertificateRequestPolicy and associated
+    // RBAC that allows approver-policy to approve trust-manager's webhook certificate
+    // automatically.
+    //
+    // Prerequisites for enabling this field:
+    // 1. The CertManager CR must have disableAutoApproval set to "true"
+    // 2. The ApproverPolicy CR must be created (approver-policy operand must be deployed)
+    //
+    // If disableAutoApproval is "true" but this field is not enabled, the trust-manager
+    // controller will set a Degraded condition because the webhook certificate cannot be
+    // approved without either the built-in approver or an approver-policy integration.
+    //
+    // If this field is enabled but the ApproverPolicy operand is not yet deployed,
+    // the controller will set a Degraded condition until approver-policy becomes available.
+    //
+    // +kubebuilder:validation:Optional
+    // +optional
+    ApproverPolicy ApproverPolicyWebhookConfig `json:"approverPolicy,omitempty"`
+}
+
+// ApproverPolicyWebhookConfig configures the approver-policy integration for
+// trust-manager's webhook TLS certificate.
+type ApproverPolicyWebhookConfig struct {
+    // enabled controls whether to create a CertificateRequestPolicy and RBAC
+    // resources that allow approver-policy to approve trust-manager's webhook
+    // TLS certificate.
+    //
+    // Prerequisites for enabling:
+    // 1. CertManager CR must have disableAutoApproval: "true"
+    // 2. ApproverPolicy CR must be created (approver-policy operand deployed)
+    //
+    // +kubebuilder:default:="Disabled"
+    // +kubebuilder:validation:Enum:=Enabled;Disabled
+    // +optional
+    Enabled ApproverPolicyWebhookPolicy `json:"enabled,omitempty"`
+
+    // certManagerServiceAccount is the name of cert-manager's ServiceAccount
+    // that will be granted permission to use the CertificateRequestPolicy.
+    // This is the ServiceAccount that cert-manager uses when creating
+    // CertificateRequests for trust-manager's webhook certificate.
+    // Defaults to "cert-manager".
+    // +kubebuilder:default:="cert-manager"
+    // +kubebuilder:validation:MinLength:=1
+    // +kubebuilder:validation:MaxLength:=253
+    // +kubebuilder:validation:Optional
+    // +optional
+    CertManagerServiceAccount string `json:"certManagerServiceAccount,omitempty"`
+}
+
+// ApproverPolicyWebhookPolicy defines the policy for the approver-policy webhook integration.
+// +kubebuilder:validation:Enum:=Enabled;Disabled
+type ApproverPolicyWebhookPolicy string
+
+const (
+    ApproverPolicyWebhookEnabled  ApproverPolicyWebhookPolicy = "Enabled"
+    ApproverPolicyWebhookDisabled ApproverPolicyWebhookPolicy = "Disabled"
+)
+```
+
+**Upstream Helm flags → Operator API mapping:**
+
+| Upstream Helm Flag | Operator API Field | Notes |
+|---|---|---|
+| `app.webhook.tls.approverPolicy.enabled` | `TrustManager.spec.trustManagerConfig.approverPolicy.enabled` | Maps to `Enabled` / `Disabled` enum |
+| `app.webhook.tls.approverPolicy.certManagerServiceAccount` | `TrustManager.spec.trustManagerConfig.approverPolicy.certManagerServiceAccount` | Default: `"cert-manager"` |
+| `app.webhook.tls.approverPolicy.certManagerNamespace` | **Operator-managed** (not exposed) | Always `cert-manager` — the operator controls the namespace where cert-manager is deployed; this is not user-configurable |
+
+> **Note**: The upstream Helm chart exposes `certManagerNamespace` because users may install cert-manager
+> in any namespace. In our operator, cert-manager is always deployed in the `cert-manager` namespace, so
+> this value is hardcoded in the ClusterRoleBinding template and not exposed through the API.
+
+**Trust-manager-controller validation matrix:**
+
+The trust-manager-controller validates three preconditions during each reconciliation:
+
+| `disableAutoApproval` | `approverPolicy.enabled` | CertificateRequestPolicy CRD exists? | Controller behavior |
+|---|---|---|---|
+| `"false"` / empty | any | any | **Normal** — built-in approver handles webhook cert. Clean up policy resources if they exist from a previous configuration. |
+| `"true"` | `Disabled` | any | **Degrade**: `"Auto-approval is disabled on CertManager CR but approverPolicy integration is not enabled. Enable spec.trustManagerConfig.approverPolicy.enabled on the TrustManager CR, or trust-manager's webhook certificate will not be approved."` |
+| `"true"` | `Enabled` | No | **Degrade**: `"approverPolicy integration is enabled but approver-policy is not installed (CertificateRequestPolicy CRD not found). Deploy the ApproverPolicy CR first."` |
+| `"true"` | `Enabled` | Yes | **Create** CertificateRequestPolicy + ClusterRole + ClusterRoleBinding. Proceed with normal reconciliation. |
+
+**Reconciliation logic (added to `reconcileTrustManagerDeployment`):**
+
+```
+step 4.5 (after createOrApplyCertificates, before createOrApplyDefaultCAPackage):
+
+  certManager := get CertManager CR "cluster"
+
+  IF certManager.spec.disableAutoApproval == "true":
+    IF trustManager.spec.trustManagerConfig.approverPolicy.enabled != "Enabled":
+      → Set Degraded=True: "Auto-approval is disabled but approverPolicy integration
+        is not enabled. Enable spec.trustManagerConfig.approverPolicy.enabled."
+      → Set Ready=False
+      → Return (do not proceed with deployment)
+    ELSE:
+      IF CertificateRequestPolicy CRD does NOT exist:
+        → Set Degraded=True: "approverPolicy integration is enabled but approver-policy
+          is not installed (CertificateRequestPolicy CRD not found). Deploy the
+          ApproverPolicy CR first."
+        → Set Ready=False
+        → Return (do not proceed with deployment)
+      ELSE:
+        → Create/update CertificateRequestPolicy (trust-manager-policy)
+        → Create/update ClusterRole (trust-manager-policy-role)
+        → Create/update ClusterRoleBinding (trust-manager-policy-binding)
+        → Continue with remaining reconciliation steps
+  ELSE:
+    IF approverPolicy resources exist (from previous configuration):
+      → Clean up CertificateRequestPolicy + RBAC
+    → Continue normally (built-in approver handles it)
+```
+
+**Resources created by trust-manager-controller (conditional on `approverPolicy.enabled: Enabled`):**
+
+1. **CertificateRequestPolicy** (`trust-manager-policy`):
+   ```yaml
+   apiVersion: policy.cert-manager.io/v1alpha1
+   kind: CertificateRequestPolicy
+   metadata:
+     name: trust-manager-policy
+     labels:
+       app.kubernetes.io/name: cert-manager-trust-manager
+       app.kubernetes.io/managed-by: cert-manager-operator
+   spec:
+     allowed:
+       commonName:
+         value: "trust-manager.cert-manager.svc"
+         required: true
+       dnsNames:
+         values: ["trust-manager.cert-manager.svc"]
+         required: true
+     selector:
+       issuerRef:
+         name: trust-manager
+         kind: Issuer
+         group: cert-manager.io
+   ```
+
+2. **ClusterRole** (`trust-manager-policy-role`):
+   ```yaml
+   apiVersion: rbac.authorization.k8s.io/v1
+   kind: ClusterRole
+   metadata:
+     name: trust-manager-policy-role
+     labels:
+       app.kubernetes.io/name: cert-manager-trust-manager
+       app.kubernetes.io/managed-by: cert-manager-operator
+   rules:
+     - apiGroups: ["policy.cert-manager.io"]
+       resources: ["certificaterequestpolicies"]
+       verbs: ["use"]
+       resourceNames: ["trust-manager-policy"]
+   ```
+
+3. **ClusterRoleBinding** (`trust-manager-policy-binding`):
+   ```yaml
+   apiVersion: rbac.authorization.k8s.io/v1
+   kind: ClusterRoleBinding
+   metadata:
+     name: trust-manager-policy-binding
+     labels:
+       app.kubernetes.io/name: cert-manager-trust-manager
+       app.kubernetes.io/managed-by: cert-manager-operator
+   roleRef:
+     apiGroup: rbac.authorization.k8s.io
+     kind: ClusterRole
+     name: trust-manager-policy-role
+   subjects:
+     - kind: ServiceAccount
+       name: cert-manager       # or value from approverPolicy.certManagerServiceAccount
+       namespace: cert-manager  # operator-managed; maps to upstream certManagerNamespace (always cert-manager)
+   ```
+
+**New bindata files (in `bindata/trust-manager/resources/`):**
+- `certificaterequestpolicy_trust-manager-policy.yml`
+- `clusterrole_trust-manager-policy-role.yml`
+- `clusterrolebinding_trust-manager-policy-binding.yml`
+
+**Why the trust-manager-controller owns this (not the approver-policy-controller):**
+- trust-manager owns its own webhook TLS lifecycle end-to-end
+- No cross-controller dependency — each controller manages its own concerns independently
+- Resources are cleaned up naturally when trust-manager CR is deleted
+- Follows the upstream pattern where these resources are part of the trust-manager Helm chart
+- The approver-policy-controller has no knowledge of trust-manager and does not need to
+
+**Required user workflow (explicit 3-step ordering):**
+
+```
+Step 1: Disable auto-approval
+  oc patch certmanager cluster --type merge -p '{"spec":{"disableAutoApproval":"true"}}'
+
+Step 2: Deploy approver-policy
+  oc apply -f approverpolicy-cr.yaml
+
+Step 3: Enable trust-manager approver-policy integration
+  oc patch trustmanager cluster --type merge \
+    -p '{"spec":{"trustManagerConfig":{"approverPolicy":{"enabled":"Enabled"}}}}'
+```
+
+Each step is explicit, each prerequisite is validated with a clear degradation message, and there are
+no silent failures. The trust-manager-controller validates all three preconditions and provides
+actionable error messages for any missing prerequisite.
+
 ### Drawbacks
 
 None
@@ -1228,6 +1629,34 @@ None
   4. Verify policy enforcement
   5. Delete ApproverPolicy CR
   6. Re-enable auto-approval on CertManager CR
+- **Trust-Manager interaction tests:**
+  - **Validation matrix tests (all four combinations):**
+    - Verify that when `disableAutoApproval` is `"false"`/empty, trust-manager operates normally regardless
+      of `approverPolicy.enabled` (built-in approver handles webhook cert). Policy resources are cleaned up
+      if they exist from a previous configuration.
+    - Verify that when `disableAutoApproval: "true"` and `approverPolicy.enabled: Disabled`, the trust-manager-controller
+      sets a Degraded condition with a clear message instructing the user to enable the field.
+    - Verify that when `disableAutoApproval: "true"` and `approverPolicy.enabled: Enabled` but the
+      `CertificateRequestPolicy` CRD does NOT exist, the controller sets a Degraded condition with a clear
+      message instructing the user to deploy the ApproverPolicy CR first.
+    - Verify that when `disableAutoApproval: "true"`, `approverPolicy.enabled: Enabled`, and the CRD exists,
+      the controller creates `CertificateRequestPolicy` + ClusterRole + ClusterRoleBinding.
+  - **End-to-end approval flow:**
+    - Verify that trust-manager's webhook certificate `CertificateRequest` is approved by approver-policy
+      when all three preconditions are met.
+  - **Deployment ordering tests:**
+    - trust-manager deployed first, then auto-approval disabled and approver-policy deployed, then
+      `approverPolicy.enabled: Enabled` set on TrustManager CR → webhook cert renewal works.
+    - approver-policy deployed first (auto-approval disabled), then trust-manager deployed with
+      `approverPolicy.enabled: Enabled` → initial webhook cert approved.
+  - **Cleanup tests:**
+    - Verify that when `disableAutoApproval` is changed back (via CR delete/recreate) and `approverPolicy.enabled`
+      is set to `Disabled`, the `CertificateRequestPolicy` and RBAC resources are cleaned up.
+    - Verify that when trust-manager CR is deleted, the `CertificateRequestPolicy` and RBAC resources are
+      cleaned up as part of normal deletion/finalizer handling.
+  - **certManagerServiceAccount field tests:**
+    - Verify that the `ClusterRoleBinding` subject uses the value from `approverPolicy.certManagerServiceAccount`
+      (default: `cert-manager`).
 
 ## Graduation Criteria
 
@@ -1283,6 +1712,13 @@ approver-policy will be supported for:
 - **Webhook TLS Issues**: If the approver-policy webhook TLS CA Secret cannot be created or managed,
   the webhook will not be available and `CertificateRequestPolicy` creation/updates will fail.
 
+- **Trust-Manager Webhook Certificate Blocked**: If `disableAutoApproval: "true"` is set on the
+  CertManager CR but the user has not enabled `approverPolicy.enabled: Enabled` on the TrustManager CR,
+  trust-manager will degrade because its webhook certificate cannot be approved. The Degraded condition
+  will include an actionable message. Similarly, if the field is enabled but approver-policy is not yet
+  deployed (CertificateRequestPolicy CRD not found), the controller will degrade until the prerequisite
+  is met.
+
 ### Example Configurations
 
 - Example ApproverPolicy CR with default signer names:
@@ -1323,6 +1759,20 @@ approver-policy will be supported for:
   spec:
     disableAutoApproval: "true"
     # ... other fields ...
+  ```
+
+- Example TrustManager CR with approver-policy integration enabled:
+  ```yaml
+  apiVersion: operator.openshift.io/v1alpha1
+  kind: TrustManager
+  metadata:
+    name: cluster
+  spec:
+    trustManagerConfig:
+      approverPolicy:
+        enabled: Enabled
+        certManagerServiceAccount: cert-manager  # default
+      # ... other fields ...
   ```
 
 - Example CertificateRequestPolicy (created by users after approver-policy is deployed):
