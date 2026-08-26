@@ -905,7 +905,13 @@ for deploying the operand.
 1. **Manifest Generation**: A script (`hack/update-approver-policy-manifests.sh`) renders the upstream
    Helm chart into static manifests, patches labels, and embeds them as bindata in the operator binary.
 
-The generated manifests are stored in `bindata/approver-policy/resources/`
+The generated manifests are split across two locations:
+- `bindata/approver-policy/resources/` — all operand resources (ServiceAccount, RBAC, Deployment,
+  Services, Secret, ValidatingWebhookConfiguration, ServiceMonitor). These are applied by the
+  approver-policy-controller when the `ApproverPolicy` CR is created.
+- `config/crd/bases/` — the `CertificateRequestPolicy` CRD. This is included in the operator's OLM
+  bundle and installed by OLM at operator installation time, consistent with how the `Bundle` CRD for
+  trust-manager is handled.
 
 2. **Runtime Customization**: When reconciling an ApproverPolicy CR, the controller:
    - Loads the static manifests from bindata
@@ -978,8 +984,13 @@ The ClusterRole for approver-policy is dynamically configured based on the `appr
 The `CertificateRequestPolicy` CRD (`policy.cert-manager.io_certificaterequestpolicies`) is a cluster-scoped
 resource from the upstream `policy.cert-manager.io` API group. This CRD will be:
 
-1. Included in the operator's bindata alongside the other approver-policy manifests.
-2. Applied to the cluster when the ApproverPolicy CR is created.
+1. Placed in `config/crd/bases/` and included in the operator's OLM bundle.
+2. Installed by OLM at operator installation time, before any `ApproverPolicy` CR is created.
+
+This is consistent with how the `Bundle` CRD for trust-manager is handled — the CRD is bundled with
+the operator and installed by OLM, while the approver-policy-controller is only responsible for
+deploying the remaining operand resources (RBAC, Deployment, Services, etc.) from bindata when the
+`ApproverPolicy` CR is created.
 
 #### Manifests for installing approver-policy
 
