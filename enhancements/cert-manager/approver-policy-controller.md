@@ -53,10 +53,11 @@ Throughout the document, the following terminology means:
 
 ## Motivation
 
-Certificate policy enforcement is critical for enterprise security. Without approver-policy, cert-manager
-automatically approves all CertificateRequests, meaning any user with permission to create a CertificateRequest
-can obtain any certificate from any configured issuer. This is unacceptable in production environments where
-certificate issuance must follow organizational policies.
+Certificate policy enforcement is critical for enterprise security. By default, cert-manager's built-in
+auto-approver approves CertificateRequests for its internal `Issuer` and `ClusterIssuer` signers; external
+signers require explicit configuration. Without approver-policy, any user who can create a CertificateRequest
+against those issuers can obtain a certificate without policy review — unacceptable in production environments
+where issuance must follow organizational policies.
 
 approver-policy solves this by:
 
@@ -167,8 +168,14 @@ cert-manager creates CertificateRequest (namespace-scoped)
 - A CertificateRequest is a one-shot resource — issuance is **not retried** on the same
   CertificateRequest. It is the parent controller's (e.g., Certificate controller) responsibility
   to create a new CertificateRequest for retries.
-- A denied CertificateRequest is **terminally failed**. If it was created for a Certificate, the
-  Certificate controller retries with exponential backoff by creating a new CertificateRequest.
+- A denied CertificateRequest is **terminally failed** — the `Denied` condition is permanent and
+  immutable. Unlike a CertificateRequest that fails due to an issuer error (where the Certificate
+  controller automatically deletes the failed CR and creates a new one with exponential backoff), a
+  **denied CertificateRequest is never automatically deleted or recreated**. The Certificate
+  controller will keep re-triggering issuance (with exponential backoff), but the request manager
+  will not create a new CertificateRequest while the denied one still exists. To retry, the user
+  must **manually delete the denied CertificateRequest** (after creating or correcting the
+  applicable `CertificateRequestPolicy`).
 
 **Default auto-approver scope:**
 
@@ -177,6 +184,11 @@ issuer types: `cert-manager.io/Issuer` and `cert-manager.io/ClusterIssuer`. Cert
 referencing external issuers are NOT auto-approved unless explicitly configured via `approveSignerNames`.
 
 Ref: [CertificateRequest — Approval](https://cert-manager.io/docs/usage/certificaterequest/#approval)
+
+This is provided as background context only. **The built-in auto-approver and approver-policy must not
+run simultaneously.** Running both means the built-in approver
+will auto-approve all requests to cert-manager's own issuers, completely bypassing any
+`CertificateRequestPolicy` rules you define for those issuers.
 
 
 #### How approver-policy Approves or Denies a CertificateRequest
@@ -365,7 +377,10 @@ the condition (e.g., `"policy.cert-manager.io"` for approver-policy). The `Messa
 
 This is the most critical design decision in this enhancement. cert-manager ships with a built-in CertificateRequest
 approver that automatically approves all requests. When approver-policy is deployed alongside this built-in approver,
-**both will race to process CertificateRequests**, making policy enforcement ineffective.
+**both will race to process CertificateRequests**. If the built-in approver wins the race and sets `Approved=True`
+first, the issuer will immediately sign the certificate — the `Denied` condition that approver-policy might
+subsequently set is irrelevant at that point, since an approved CertificateRequest is already being processed.
+This makes any `CertificateRequestPolicy` enforcement silently ineffective, with no visible error.
 
 Per the [upstream documentation](https://cert-manager.io/docs/policy/approval/approver-policy/installation/):
 
@@ -383,8 +398,24 @@ the built-in approver.
    into the cert-manager controller deployment args. This disables only the built-in approver while keeping all
    other cert-manager controllers functional.
 2. The cert-manager controller pod restarts with the updated args.
-3. From this point, **no CertificateRequests will be auto-approved** — an external approver (like approver-policy)
+3. The operator also **deletes** the `cert-manager-controller-approve:cert-manager-io` ClusterRole and its
+   ClusterRoleBinding. cert-manager's admission webhook enforces that any entity setting an `Approved` or `Denied`
+   condition on a CertificateRequest must hold the `approve` verb on the corresponding `signers` resource
+   (verified via SubjectAccessReview). Removing this ClusterRole means the `cert-manager` ServiceAccount
+   loses the RBAC capability to approve CRs entirely — ensuring that even if the controller flag is
+   somehow reverted, the built-in approver cannot silently bypass policies.
+4. From this point, **no CertificateRequests will be auto-approved** — an external approver (like approver-policy)
    must be deployed to approve them.
+5. **Soft-disable guard (CertManager CR delete/recreate path):** If the CertManager CR is later deleted and
+   recreated without `disableAutoApproval: "true"`, the cert-manager reconciler checks whether the
+   approver-policy Deployment still exists in the `cert-manager` namespace before applying the cert-manager
+   resources. If it does:
+   - The reconciler **keeps** `--controllers=*,-certificaterequests-approver` in the cert-manager Deployment
+     args.
+   - It sets an `AutoApproverDisabled` status condition on the CertManager CR with
+     `reason=ApproverPolicyDeploymentActive` and a message instructing the user to remove the approver-policy
+     Deployment before auto-approval can be restored.
+   - This prevents the race condition even when Layers 1–3 no longer apply.
 
 **Why this design:**
 
@@ -399,11 +430,12 @@ Option A is chosen because:
 - **Explicitness**: The field is clearly documented and auditable in the CertManager CR.
 - **Decoupling**: The cert-manager configuration is independent of the approver-policy lifecycle.
 
-**Workflow:**
+**Workflow — enabling approver-policy:**
 ```
 Step 1: Disable auto-approval
   oc patch certmanager cluster --type merge -p '{"spec":{"disableAutoApproval":"true"}}'
   → cert-manager controller restarts with --controllers=*,-certificaterequests-approver
+  → operator deletes cert-manager-controller-approve:cert-manager-io ClusterRole and ClusterRoleBinding
 
 Step 2: Deploy approver-policy
   oc apply -f approver-policy-cr.yaml
@@ -414,6 +446,18 @@ Step 3: Create CertificateRequestPolicies
   → approver-policy evaluates future CertificateRequests against this policy
 ```
 
+**Workflow — restoring auto-approval (e.g. after fully removing approver-policy):**
+```
+Step 1: Remove the approver-policy Deployment
+  oc delete deployment cert-manager-approver-policy -n cert-manager
+  → cert-manager reconciler will no longer detect a competing approver in the cert-manager namespace
+
+Step 2: Delete and recreate the CertManager CR
+  oc delete certmanager cluster
+  oc apply -f certmanager-cluster.yaml  # without disableAutoApproval: "true"
+  → cert-manager-controller-approve ClusterRole/CRB are re-applied; built-in approver restarts
+```
+
 **Safety Enforcement in ApproverPolicy Controller:**
 
 The `approver-policy-controller` will check the `CertManager` CR before deploying the operand:
@@ -422,14 +466,14 @@ The `approver-policy-controller` will check the `CertManager` CR before deployin
 - The controller will **not deploy** the approver-policy operand until auto-approval is disabled. This
   prevents the race condition entirely.
 
-#### Preventing Re-enabling Auto-Approval (Two-Layer Defense)
+#### Preventing Re-enabling Auto-Approval (Four-Layer Defense)
 
 A critical edge case is: **what happens if a user re-enables auto-approval after approver-policy is already
 deployed?** If allowed, the built-in cert-manager approver would restart and race with approver-policy again,
 silently bypassing all `CertificateRequestPolicy` rules. This is especially dangerous because there is no
 visible error — CertificateRequests appear to work normally, but policies are being bypassed.
 
-To prevent this, we implement a **two-layer defense**:
+To prevent this, we implement a **four-layer defense**:
 
 **Layer 1 — CEL Immutability Guard (Preventive):**
 
@@ -462,6 +506,44 @@ re-enabled (e.g., CertManager CR deleted and recreated without the field, or man
   3. The approver-policy deployment **remains running** (not torn down) but the status clearly indicates
      the problem, allowing the user to fix the CertManager CR without re-deploying.
 
+**Layer 3 — RBAC Removal (Preventive, Capability-Level):**
+
+When `disableAutoApproval` is set to `"true"`, the operator **deletes** the
+`cert-manager-controller-approve:cert-manager-io` ClusterRole and its ClusterRoleBinding. cert-manager's
+admission webhook enforces the `approve` verb on `signers` via SubjectAccessReview for any entity setting an
+`Approved` or `Denied` condition on a CertificateRequest. Without this ClusterRole, the `cert-manager`
+ServiceAccount cannot approve CRs even if the built-in approver controller were accidentally re-started (e.g.,
+via CertManager CR delete-and-recreate without `disableAutoApproval=true`). The failure in that case is an
+explicit RBAC error rather than a silent policy bypass.
+
+Note: approver-policy has its own `approve` RBAC on `signers` (with no `resourceNames` restriction), so
+removing cert-manager's ClusterRole has no impact on approver-policy's ability to approve CRs.
+
+**Layer 4 — Soft-Disable Guard in cert-manager Reconciler (Preventive, Runtime):**
+
+On every reconciliation of the CertManager CR, the cert-manager reconciler
+**checks whether the approver-policy Deployment exists** in the `cert-manager` namespace. If it does
+and `disableAutoApproval` is not `"true"`:
+- The cert-manager Deployment is kept with `--controllers=*,-certificaterequests-approver`.
+- An `AutoApproverDisabled` status condition is set on the CertManager CR:
+
+  ```yaml
+  status:
+    conditions:
+    - type: AutoApproverDisabled
+      status: "True"
+      reason: ApproverPolicyDeploymentActive
+      message: "Auto-approval cannot be re-enabled while the approver-policy Deployment exists in the cert-manager namespace. Remove the approver-policy Deployment first, then recreate the CertManager CR without disableAutoApproval to restore auto-approval."
+  ```
+
+When no approver-policy Deployment is found and `disableAutoApproval` is not `"true"`, the reconciler
+applies the cert-manager resources normally (built-in approver enabled, ClusterRole/CRB present) and
+sets the condition to `status: "False"`.
+
+The condition provides an observable signal for operators:
+```bash
+oc get certmanager cluster -o jsonpath='{.status.conditions[?(@.type=="AutoApproverDisabled")]}'
+```
 
 ### Deploying approver-policy
 
@@ -540,9 +622,10 @@ flowchart TB
 
     subgraph PolicyWorkflow["Step 3: Policy Enforcement"]
         U[Admin creates<br/>CertificateRequestPolicy CRs] --> V[approver-policy evaluates<br/>incoming CertificateRequests]
-        V --> W{Request matches<br/>policy + RBAC?}
-        W -->|Yes + Allowed| W1[Approve CertificateRequest]
-        W -->|No match or Denied| W2[Deny CertificateRequest]
+        V --> W{Matching policy<br/>found?}
+        W -->|No matching policy| W3[No action — CR stays pending]
+        W -->|Policy matched,<br/>all evaluators deny| W2[Deny CertificateRequest]
+        W -->|Policy matched,<br/>evaluator allows| W1[Approve CertificateRequest]
     end
 
     C --> D
@@ -605,6 +688,30 @@ type CertManagerSpec struct {
 }
 ```
 
+A new `AutoApproverDisabled` status condition is added to `CertManagerStatus` to surface the **effective**
+state of auto-approval in the running cluster, independently of the spec field:
+
+```golang
+// CertManagerStatus defines the observed state of CertManager.
+type CertManagerStatus struct {
+	apiv1.OperatorStatus `json:",inline"`
+	// Conditions holds a list of status conditions for the CertManager resource.
+	// +optional
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+```
+
+| Condition type                        | Reason                           | Meaning                                                                                                 |
+| ------------------------------------- | -------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `AutoApproverDisabled`                | `DisabledBySpec`                 | `disableAutoApproval: "true"` set in spec — controller flag injected, ClusterRole removed               |
+| `AutoApproverDisabled`                | `ApproverPolicyDeploymentActive` | Spec does not request disable, but the approver-policy Deployment exists — soft-disable guard is active |
+| `AutoApproverDisabled` (status=False) | `AutoApprovalEnabled`            | Auto-approval is fully enabled; no competing approver Deployment detected                               |
+
+The condition allows operators to distinguish between "user explicitly disabled" and "soft-disabled by the guard", and provides a stable signal to watch:
+```bash
+oc get certmanager cluster -o jsonpath='{.status.conditions[?(@.type=="AutoApproverDisabled")]}'
+```
+
 #### 2. Changes to Existing `TrustManager` CR
 
 > **Context**: When the built-in cert-manager auto-approver is disabled (required for approver-policy),
@@ -632,14 +739,15 @@ type TrustManagerConfig struct {
 	//
 	// Prerequisites for enabling this field:
 	// 1. The CertManager CR must have disableAutoApproval set to "true"
-	// 2. The ApproverPolicy CR must be created (approver-policy operand must be deployed)
+	// 2. The approver-policy Deployment must be available in the cert-manager namespace
 	//
 	// If disableAutoApproval is "true" but this field is not enabled, the trust-manager
 	// controller will set a Degraded condition because the webhook certificate cannot be
 	// approved without either the built-in approver or an approver-policy integration.
 	//
-	// If this field is enabled but the ApproverPolicy operand is not yet deployed,
-	// the controller will set a Degraded condition until approver-policy becomes available.
+	// If this field is enabled but the approver-policy Deployment is not yet available
+	// in the cert-manager namespace, the controller will set a Degraded condition until
+	// the operand becomes ready.
 	//
 	// +kubebuilder:validation:Optional
 	// +optional
@@ -655,7 +763,7 @@ type ApproverPolicyWebhookConfig struct {
 	//
 	// Prerequisites for enabling:
 	// 1. CertManager CR must have disableAutoApproval: "true"
-	// 2. ApproverPolicy CR must be created (approver-policy operand deployed)
+	// 2. The approver-policy Deployment must be available in the cert-manager namespace
 	//
 	// +kubebuilder:default:="Disabled"
 	// +kubebuilder:validation:Enum:=Enabled;Disabled
@@ -1317,17 +1425,21 @@ Below are example static manifests used for creating required resources for inst
 
 - **Re-enabling Auto-Approval While Approver-Policy Is Active**: If auto-approval is re-enabled while
   approver-policy is still deployed, both approvers race and policy enforcement is silently bypassed.
-  - Mitigation: **Two-layer defense** — (1) CEL immutability guard on `disableAutoApproval` prevents changing
-    it from `"true"` to `"false"` via API updates (same pattern as `defaultNetworkPolicy`), and (2) the
-    approver-policy-controller continuously validates the CertManager CR and sets a `Degraded` condition if
-    auto-approval is detected as enabled. See [Preventing Re-enabling Auto-Approval](#preventing-re-enabling-auto-approval-two-layer-defense) section for details.
+  - Mitigation: **Four-layer defense** — (1) CEL immutability guard on `disableAutoApproval` prevents changing
+    it from `"true"` to `"false"` via API updates, (2) the approver-policy-controller continuously validates the
+    CertManager CR and sets a `Degraded` condition if auto-approval is detected as enabled, (3) the approve
+    ClusterRole/CRB are deleted so the cert-manager ServiceAccount loses the RBAC capability to approve CRs, and
+    (4) a soft-disable guard in the cert-manager reconciler detects an existing approver-policy Deployment and
+    refuses to restore auto-approval until it is removed. See [Preventing Re-enabling Auto-Approval](#preventing-re-enabling-auto-approval-four-layer-defense) for details.
 
 - **Re-enabling Auto-Approval After Removing Approver-Policy**: Since `disableAutoApproval` is immutable once
-  set to `"true"`, a user who removes approver-policy and wants to return to auto-approval must delete and
-  recreate the CertManager CR. This causes a brief disruption to cert-manager.
+  set to `"true"`, a user who removes approver-policy and wants to return to auto-approval must: (1) remove the
+  approver-policy Deployment (required by Layer 4 guard), then (2) delete and recreate the CertManager CR
+  without `disableAutoApproval: "true"`. This causes a brief disruption to cert-manager.
   - Mitigation: Documentation clearly states the required steps. The CertManager CR recreation is intentional
     friction to prevent accidental security degradation. All cert-manager configuration (overrideArgs, network
-    policies, etc.) should be re-applied when recreating the CR.
+    policies, etc.) should be re-applied when recreating the CR. The `AutoApproverDisabled` status condition
+    on the CertManager CR indicates when the guard is still active (i.e., the Deployment still exists).
 
 - **Trust-Manager Webhook Certificate Blocked When Auto-Approval Is Disabled**: trust-manager uses a cert-manager
   `Certificate` resource to provision its webhook TLS. When `disableAutoApproval: "true"` is set, the built-in
@@ -1335,8 +1447,9 @@ Below are example static manifests used for creating required resources for inst
   trust-manager's webhook from starting (new deployments) or renewing (existing deployments).
   - Mitigation: A new `approverPolicy` field on the TrustManager CR allows users to explicitly enable the
     creation of a `CertificateRequestPolicy` and RBAC resources for trust-manager's webhook certificate.
-    The trust-manager-controller validates all three preconditions (auto-approval disabled, field enabled,
-    approver-policy deployed) and degrades with clear messages if any are missing. See the
+    The trust-manager-controller validates all four preconditions (auto-approval disabled, field enabled,
+    approver-policy deployed, and `approveSignerNames` coverage) and degrades with clear messages if any
+    are missing. See the
     [Interaction with Trust-Manager](#interaction-with-trust-manager) section for full details.
 
 ### Interaction with Trust-Manager
@@ -1439,14 +1552,22 @@ The API definition for the new `approverPolicy` field on `TrustManagerConfig` is
 
 **Trust-manager-controller validation matrix:**
 
-The trust-manager-controller validates three preconditions during each reconciliation:
+The trust-manager-controller validates four preconditions during each reconciliation:
 
-| `disableAutoApproval` | `approverPolicy.enabled` | CertificateRequestPolicy CRD exists? | Controller behavior                                                                                                                                                                                                                                    |
-| --------------------- | ------------------------ | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `"false"` / empty     | any                      | any                                  | **Normal** — built-in approver handles webhook cert. Clean up policy resources if they exist from a previous configuration.                                                                                                                            |
-| `"true"`              | `Disabled`               | any                                  | **Degrade**: `"Auto-approval is disabled on CertManager CR but approverPolicy integration is not enabled. Enable spec.trustManagerConfig.approverPolicy.enabled on the TrustManager CR, or trust-manager's webhook certificate will not be approved."` |
-| `"true"`              | `Enabled`                | No                                   | **Degrade**: `"approverPolicy integration is enabled but approver-policy is not installed (CertificateRequestPolicy CRD not found). Deploy the ApproverPolicy CR first."`                                                                              |
-| `"true"`              | `Enabled`                | Yes                                  | **Create** CertificateRequestPolicy + ClusterRole + ClusterRoleBinding. Proceed with normal reconciliation.                                                                                                                                            |
+| `disableAutoApproval` | `approverPolicy.enabled` | approver-policy Deployment available? | `approveSignerNames` covers `issuers.cert-manager.io/*`? | Controller behavior                                                                                                                                                                                                                                                                                                                                                          |
+| --------------------- | ------------------------ | ------------------------------------- | -------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `"false"` / empty     | any                      | any                                   | n/a                                                      | **Normal** — built-in approver handles webhook cert. Clean up policy resources if they exist from a previous configuration.                                                                                                                                                                                                                                                  |
+| `"true"`              | `Disabled`               | any                                   | n/a                                                      | **Degrade**: `"Auto-approval is disabled on CertManager CR but approverPolicy integration is not enabled. Enable spec.trustManagerConfig.approverPolicy.enabled on the TrustManager CR, or trust-manager's webhook certificate will not be approved."`                                                                                                                       |
+| `"true"`              | `Enabled`                | No                                    | n/a                                                      | **Degrade**: `"approverPolicy integration is enabled but the approver-policy Deployment is not available in the cert-manager namespace. Create the ApproverPolicy CR and wait for the operand to become ready."`                                                                                                                                                             |
+| `"true"`              | `Enabled`                | Yes                                   | No                                                       | **Degrade**: `"approverPolicy.approveSignerNames on the ApproverPolicy CR is restricted and does not include 'issuers.cert-manager.io/*' (or a signer name matching trust-manager's Issuer). approver-policy will not have RBAC to approve trust-manager's webhook CertificateRequest, which will remain pending indefinitely. Add a matching entry to approveSignerNames."` |
+| `"true"`              | `Enabled`                | Yes                                   | Yes / empty (all signers)                                | **Create** CertificateRequestPolicy + ClusterRole + ClusterRoleBinding. Proceed with normal reconciliation.                                                                                                                                                                                                                                                                  |
+
+**Deployment check:** Confirms approver-policy is actually running and able to process `CertificateRequests` — not just that the CRD is registered. Consistent with the soft-disable guard (Layer 4) which uses the same Deployment presence check. The trust-manager-controller watches Deployments in the `cert-manager` namespace (where both operands live), avoiding any cross-controller CR dependency.
+
+**approveSignerNames check:** trust-manager's webhook `CertificateRequest` uses signer name
+`issuers.cert-manager.io/<namespace>.trust-manager`. If `approveSignerNames` is restricted and does not cover
+`issuers.cert-manager.io/*`, approver-policy lacks RBAC to set `Approved` and the request stays pending indefinitely
+— even when the `CertificateRequestPolicy` matches. See [Dynamic ClusterRole Rules](#dynamic-clusterrole-rules).
 
 
 **Why the trust-manager-controller owns this (not the approver-policy-controller):**
@@ -1470,6 +1591,11 @@ Step 3: Enable trust-manager approver-policy integration
     -p '{"spec":{"trustManagerConfig":{"approverPolicy":{"enabled":"Enabled"}}}}'
 ```
 
+> **Note**: If `approveSignerNames` is customized on the `ApproverPolicy` CR (step 2), it must include an entry
+> matching `issuers.cert-manager.io/*` (the default, empty `approveSignerNames` already covers this). Otherwise
+> the trust-manager-controller degrades per the validation matrix above instead of leaving the webhook certificate
+> silently stuck pending.
+
 ### Drawbacks
 
 None
@@ -1485,6 +1611,24 @@ None
 - Verify approver-policy controller starts only when the operator's `ApproverPolicy` feature gate is enabled.
 - Verify that setting `disableAutoApproval: "true"` on the CertManager CR causes the cert-manager controller
   to restart with `--controllers=*,-certificaterequests-approver`.
+- Verify that setting `disableAutoApproval: "true"` also **deletes** the
+  `cert-manager-controller-approve:cert-manager-io` ClusterRole and its ClusterRoleBinding from the cluster.
+- Verify that when `disableAutoApproval` is NOT set (default), the
+  `cert-manager-controller-approve:cert-manager-io` ClusterRole and ClusterRoleBinding are present and
+  cert-manager's built-in auto-approver functions normally.
+- Verify that after `disableAutoApproval: "true"` is set (ClusterRole removed), cert-manager's issuer
+  controllers (CA, ACME, etc.) continue to sign certificates that are approved by approver-policy — i.e.,
+  removing the ClusterRole has no impact on signing functionality.
+- **Soft-disable guard (Layer 4) tests:**
+  - Verify that if the CertManager CR is deleted and recreated **without** `disableAutoApproval: "true"`
+    while the approver-policy Deployment still exists in the `cert-manager` namespace, the cert-manager
+    reconciler keeps `--controllers=*,-certificaterequests-approver` and does not re-apply the approve
+    ClusterRole/CRB (no race condition).
+  - Verify that the `AutoApproverDisabled` status condition on the CertManager CR is set to
+    `status=True, reason=ApproverPolicyDeploymentActive` in this scenario.
+  - Verify that after removing the approver-policy Deployment and then recreating the CertManager CR
+    without `disableAutoApproval: "true"`, the built-in approver is restored normally and the
+    `AutoApproverDisabled` condition transitions to `status=False, reason=AutoApprovalEnabled`.
 - Verify that creating an ApproverPolicy CR when `disableAutoApproval` is NOT `"true"` results in a `Degraded`
   condition and no deployment.
 - Enable `approver-policy-controller` by creating `approverpolicies.operator.openshift.io` CR and check the
@@ -1495,31 +1639,45 @@ None
   - Common configurations: log levels and formats, resources, node selector, tolerations and affinity
 - Test CertificateRequestPolicy functionality:
   - Create `CertificateRequestPolicy` resources with various allowed/constraints configurations
-  - Verify that CertificateRequests matching policies are approved
-  - Verify that CertificateRequests NOT matching any policy are denied
+  - Verify that CertificateRequests matching a policy whose evaluators all pass are approved
+  - Verify that CertificateRequests matching a policy whose evaluators deny are denied
+  - Verify that CertificateRequests with **no matching policy** remain **pending** — no `Approved` or
+    `Denied` condition is set (approver-policy takes no action; the CR stays unprocessed)
   - Verify RBAC-based policy binding works correctly
+- Test denied CertificateRequest behavior:
+  - Verify that a denied CertificateRequest is **not** automatically deleted or recreated by cert-manager
+    (unlike a `Failed` CR, which is retried automatically).
+  - Verify that after manually deleting the denied CertificateRequest and creating/correcting a matching
+    `CertificateRequestPolicy`, a new CertificateRequest is created and approved.
 - Test the full lifecycle:
   1. Disable auto-approval on CertManager CR
   2. Deploy approver-policy
   3. Create policies
   4. Verify policy enforcement
   5. Delete ApproverPolicy CR
-  6. Delete and recreate CertManager CR (without `disableAutoApproval: "true"`) to restore auto-approval
+  6. Remove the approver-policy Deployment (required before auto-approval can be restored)
+  7. Delete and recreate CertManager CR (without `disableAutoApproval: "true"`) to restore auto-approval
 - **Trust-Manager interaction tests:**
-  - **Validation matrix tests (all four combinations):**
+  - **Validation matrix tests (all five combinations):**
     - Verify that when `disableAutoApproval` is `"false"`, trust-manager operates normally regardless
       of `approverPolicy.enabled`. Policy resources are cleaned up
       if they exist from a previous configuration.
     - Verify that when `disableAutoApproval: "true"` and `approverPolicy.enabled: Disabled`, the trust-manager-controller
       sets a Degraded condition with a clear message instructing the user to enable the field.
     - Verify that when `disableAutoApproval: "true"` and `approverPolicy.enabled: Enabled` but the
-      `CertificateRequestPolicy` CRD does NOT exist, the controller sets a Degraded condition with a clear
-      message instructing the user to deploy the ApproverPolicy CR first.
-    - Verify that when `disableAutoApproval: "true"`, `approverPolicy.enabled: Enabled`, and the CRD exists,
-      the controller creates `CertificateRequestPolicy` + ClusterRole + ClusterRoleBinding.
+      approver-policy Deployment is not available in the `cert-manager` namespace, the controller sets a
+      Degraded condition with a clear message instructing the user to create the ApproverPolicy CR first.
+    - Verify that when `disableAutoApproval: "true"`, `approverPolicy.enabled: Enabled`, Deployment is
+      available, but the `ApproverPolicy` CR's `approveSignerNames` is non-empty and does not include an entry
+      matching `issuers.cert-manager.io/*` (or the specific `issuers.cert-manager.io/<namespace>.trust-manager`
+      signer), the controller sets a Degraded condition instructing the user to update `approveSignerNames` — and
+      does NOT create the `CertificateRequestPolicy`/RBAC resources (avoiding a silently-stuck-pending CertificateRequest).
+    - Verify that when `disableAutoApproval: "true"`, `approverPolicy.enabled: Enabled`, Deployment is available,
+      and `approveSignerNames` is empty (all signers) or explicitly includes a matching entry, the controller
+      creates `CertificateRequestPolicy` + ClusterRole + ClusterRoleBinding.
   - **End-to-end approval flow:**
     - Verify that trust-manager's webhook certificate `CertificateRequest` is approved by approver-policy
-      when all three preconditions are met.
+      when all four preconditions are met.
   - **Deployment ordering tests:**
     - trust-manager deployed first, then auto-approval disabled and approver-policy deployed, then
       `approverPolicy.enabled: Enabled` set on TrustManager CR → webhook cert renewal works.
@@ -1547,6 +1705,7 @@ approver-policy will be available as Tech Preview starting from cert-manager-ope
 - Feature is enabled by default; feature available on all clusters.
 - Complete end-user documentation.
 - Complete UTs and e2e tests are present.
+- Investigate NetworkPolicy requirements for approver-policy.
 
 ### Removing a deprecated feature
 
@@ -1588,6 +1747,16 @@ approver-policy will be supported for:
 
 
 ### Example Configurations
+
+- Minimal valid ApproverPolicy CR (all operand settings use defaults):
+  ```yaml
+  apiVersion: operator.openshift.io/v1alpha1
+  kind: ApproverPolicy
+  metadata:
+    name: cluster
+  spec:
+    approverPolicyConfig: {}
+  ```
 
 - Example ApproverPolicy CR with default signer names:
   ```yaml
@@ -1703,7 +1872,41 @@ approver-policy will be supported for:
 - Checking CertificateRequest approval status
   ```bash
   oc get certificaterequests -A -o wide
+  oc get certificaterequest <name> -n <namespace> -o jsonpath='{range .status.conditions[*]}{.type}{"="}{.status}{" reason="}{.reason}{" message="}{.message}{"\n"}{end}'
+  oc describe certificaterequest <name> -n <namespace>
   ```
+
+- **CertificateRequest denied** (`Denied=True`, `reason=policy.cert-manager.io`): A matching policy was found
+  but `allowed`/`constraints` evaluation failed. Read the `message` on the `Denied` condition — it lists the
+  policy violations. Update the `CertificateRequestPolicy` (or create a matching one), then **delete the
+  denied CertificateRequest** to retry; denied conditions are immutable and cert-manager does not recreate
+  the CR automatically.
+
+- **CertificateRequest pending** (no `Approved` or `Denied` condition): approver-policy took no action.
+  Work through these checks in order:
+  1. **Matching policy exists?** Confirm a `CertificateRequestPolicy` selector matches the request's
+     `spec.issuerRef` and namespace, and the policy `Ready` condition is `True`:
+     ```bash
+     oc get certificaterequestpolicies -o yaml
+     oc get certificaterequest <name> -n <namespace> -o jsonpath='{.spec.issuerRef}{"\n"}'
+     ```
+  2. **Requesting identity has `use` access?** approver-policy only evaluates policies the request creator
+     can `use`. Check `spec.username`/`spec.groups` on the CertificateRequest, then verify a ClusterRole
+     (with `resourceNames` listing the policy name) grants `use` on
+     `certificaterequestpolicies.policy.cert-manager.io` to that identity:
+     ```bash
+     oc get certificaterequest <name> -n <namespace> -o jsonpath='username={.spec.username} groups={.spec.groups}{"\n"}'
+     oc get clusterrole,clusterrolebinding -o yaml | grep -A5 certificaterequestpolicies
+     ```
+  3. **approver-policy can approve this signer?** If `approveSignerNames` is set on the `ApproverPolicy` CR,
+     the approver-policy ClusterRole `resourceNames` must include a signer name matching the request's
+     issuer (e.g. `issuers.cert-manager.io/*` for namespace-scoped Issuers). A mismatch leaves the CR
+     pending even when a policy matches — check approver-policy pod logs and CertificateRequest events:
+     ```bash
+     oc get approverpolicy cluster -o jsonpath='{.spec.approverPolicyConfig.approveSignerNames}{"\n"}'
+     oc get events -n <namespace> --field-selector involvedObject.name=<certificaterequest-name>
+     oc logs -n cert-manager deployment/cert-manager-approver-policy
+     ```
 
 ## Implementation History
 
